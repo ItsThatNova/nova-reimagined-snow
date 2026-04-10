@@ -26,6 +26,7 @@
   },
   "suggests": {
     "iris": "*",
-    "distanthorizons": "*"
+    "distanthorizons": "*",
+    "seasoncache": "*"
   }
 }

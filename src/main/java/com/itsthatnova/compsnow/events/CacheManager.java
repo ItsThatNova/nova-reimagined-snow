@@ -65,7 +65,8 @@ public class CacheManager {
     private enum Source {
         UNKNOWN,
         DH,
-        VANILLA
+        VANILLA,
+        AUTHORITATIVE
     }
 
     public static final class DiagnosticsSnapshot {
@@ -158,6 +159,24 @@ public class CacheManager {
         return cache.get(packKey(chunkX, chunkZ));
     }
 
+
+    public void resetForAuthoritativeSession() {
+        cache.clear();
+        sourceMap.clear();
+        dirty.clear();
+        diagDetailedLogsRemaining = 50;
+        snapshotAndResetDiagnostics();
+    }
+
+    public boolean writeAuthoritativeToTexture(int chunkX, int chunkZ, boolean snowy, SnowBiomeTexture tex) {
+        float intensity = snowy ? 1.0f : 0.0f;
+        // Persist authoritative data to the cache so it survives re-anchor repaints.
+        // In authoritative mode the standalone path is inactive, so there is no risk
+        // of mixing standalone and authoritative data in the cache.
+        applyChunkState(chunkX, chunkZ, intensity, tex, true, "authoritative");
+        return intensity > 0.0f;
+    }
+
     /**
      * Canonical cached-write path for any source that already has a cache entry.
      */
@@ -219,6 +238,37 @@ public class CacheManager {
         return count;
     }
 
+    /**
+     * Writes only cached chunks within a Chebyshev window around the anchor to
+     * the texture. Used on re-anchor repaints to avoid writing chunks that would
+     * alias into in-range texels.
+     *
+     * @param tex     texture to write into (anchor already updated before call)
+     * @param anchorX anchor chunk X
+     * @param anchorZ anchor chunk Z
+     * @param radius  Chebyshev radius — chunks with |dx| >= radius or |dz| >= radius
+     *                are skipped (they are outside the valid texel window)
+     * @return number of chunks written
+     */
+    public int writeWindowedCacheToTexture(SnowBiomeTexture tex, int anchorX, int anchorZ, int radius) {
+        if (!loaded && cache.isEmpty()) return 0;
+
+        int count = 0;
+        for (Map.Entry<Long, Float> entry : cache.entrySet()) {
+            long key = entry.getKey();
+            int chunkX = (int) (key & 0xFFFFFFFFL);
+            int chunkZ = (int) (key >>> 32);
+            if (Math.abs(chunkX - anchorX) < radius && Math.abs(chunkZ - anchorZ) < radius) {
+                applyChunkState(chunkX, chunkZ, entry.getValue(), tex, false, "cache-restore");
+                count++;
+            }
+        }
+
+        LOGGER.warn("Windowed cache restore wrote {} chunks into the texture (anchor [{},{}] radius {})",
+                count, anchorX, anchorZ, radius);
+        return count;
+    }
+
     public void tickFlush() {
         if (dirty.isEmpty()) return;
         long now = System.currentTimeMillis();
@@ -242,7 +292,7 @@ public class CacheManager {
         // Block DH from zeroing out a chunk that vanilla has confirmed as snowy.
         if (incomingSource == Source.DH && intensity <= 0.0f
                 && previous != null && previous > 0.0f
-                && previousSource == Source.VANILLA) {
+                && (previousSource == Source.VANILLA || previousSource == Source.AUTHORITATIVE)) {
             diagDhFalseBlocked.incrementAndGet();
             LOGGER.debug("Blocked {} zero-intensity overwrite for chunk ({}, {}) because vanilla-confirmed intensity {} is retained",
                     source, chunkX, chunkZ, previous);
@@ -332,7 +382,7 @@ public class CacheManager {
         for (Map.Entry<Long, Float> entry : cache.entrySet()) {
             long key = entry.getKey();
             Source src = sourceMap.getOrDefault(key, Source.UNKNOWN);
-            if (src != Source.VANILLA) {
+            if (src != Source.VANILLA && src != Source.AUTHORITATIVE) {
                 int cx = unpackX(key);
                 int cz = unpackZ(key);
                 result.add(new long[]{cx, cz});
@@ -356,7 +406,7 @@ public class CacheManager {
                                               SnowBiomeTexture tex) {
         long key = packKey(chunkX, chunkZ);
         Source src = sourceMap.getOrDefault(key, Source.UNKNOWN);
-        if (src == Source.VANILLA) {
+        if (src == Source.VANILLA || src == Source.AUTHORITATIVE) {
             return false; // vanilla confirmed — leave it alone
         }
         Float previous = cache.get(key);
@@ -472,6 +522,9 @@ public class CacheManager {
         }
         if (source.startsWith("vanilla-") || source.contains("refine")) {
             return Source.VANILLA;
+        }
+        if (source.startsWith("authoritative")) {
+            return Source.AUTHORITATIVE;
         }
         return Source.UNKNOWN;
     }

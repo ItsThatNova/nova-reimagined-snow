@@ -1,6 +1,7 @@
 package com.itsthatnova.compsnow.events;
 
 import com.itsthatnova.compsnow.config.SnowVariantConfig;
+import com.itsthatnova.compsnow.integration.SeasonCacheBridge;
 import com.itsthatnova.compsnow.texture.ResolvedSnowVariantSet;
 import com.itsthatnova.compsnow.texture.SnowBiomeTexture;
 import com.itsthatnova.compsnow.texture.SnowVariantResolver;
@@ -8,20 +9,17 @@ import com.itsthatnova.compsnow.texture.SnowVariantTextureSet;
 import com.seibel.distanthorizons.api.interfaces.world.IDhApiLevelWrapper;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.registry.RegistryKey;
 import net.minecraft.resource.ResourceManager;
 import net.minecraft.text.Text;
 import net.minecraft.world.World;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
+
 /**
  * Central coordinator for Nova Reimagined Snow.
- *
- * All data sources now flow through the same chunk-update routes:
- *   - vanilla chunk load queue (refinement / ground truth)
- *   - DH listener (terrain-repo sampling)
- *   - DH scanner (background terrain-repo sampling)
- *   - cache restore on join/reallocation
  */
 public class SnowBiomeManager {
 
@@ -31,6 +29,24 @@ public class SnowBiomeManager {
 
     private static final float DEBUG_EPSILON = 0.000001f;
     private static final float ACTIVE_THRESHOLD = 0.001f;
+    private static final int AUTHORITATIVE_PROBE_TICKS = 60;
+
+    // Re-anchor policy constants.
+    // The texture covers ANCHOR_RADIUS chunks in each direction from the anchor.
+    // If the player drifts more than RE_ANCHOR_THRESHOLD chunks from the anchor,
+    // the texture is recentered on the next periodic check.
+    // Teleports (sudden movement > TELEPORT_THRESHOLD chunks in one tick) trigger
+    // an immediate re-anchor without waiting for the periodic interval.
+    private static final int ANCHOR_RADIUS           = SnowBiomeTexture.HALF_SIZE; // 128
+    private static final int RE_ANCHOR_INTERVAL_TICKS = 1200; // 60 seconds at 20 TPS
+    private static final int RE_ANCHOR_THRESHOLD      = 128;  // chunks from anchor
+    private static final int TELEPORT_THRESHOLD       = 8;    // chunks/tick sudden jump
+
+    private enum RuntimeMode {
+        STANDALONE,
+        AUTHORITATIVE_PENDING,
+        AUTHORITATIVE_ACTIVE
+    }
 
     private final SnowBiomeTexture texture = new SnowBiomeTexture();
     private final ChunkUpdateQueue queue = new ChunkUpdateQueue();
@@ -43,6 +59,23 @@ public class SnowBiomeManager {
 
     private int lastRenderDistance = -1;
     private boolean needsUpload = false;
+    private RuntimeMode runtimeMode = RuntimeMode.STANDALONE;
+    private boolean seasonCacheBridgeAvailable = false;
+    private int authoritativeProbeTicksRemaining = 0;
+    private Boolean lastSnapshotInProgress = null;
+    private Integer lastAuthoritativeEpoch = null;
+    private long authoritativeChunkEventsApplied = 0;
+    private long authoritativeResetsApplied = 0;
+
+    // Player-relative anchor tracking.
+    // anchorChunkX/Z: the chunk the texture is currently centered on.
+    // lastPlayerChunkX/Z: player chunk last tick, for teleport detection.
+    // reAnchorTickCounter: countdown to next periodic drift check.
+    private int anchorChunkX = 0;
+    private int anchorChunkZ = 0;
+    private int lastPlayerChunkX = Integer.MIN_VALUE;
+    private int lastPlayerChunkZ = Integer.MIN_VALUE;
+    private int reAnchorTickCounter = RE_ANCHOR_INTERVAL_TICKS;
 
     private float currentRainGradient = 0.0f;
     private float currentThunderGradient = 0.0f;
@@ -59,8 +92,8 @@ public class SnowBiomeManager {
     private long weatherSampleIndex = 0;
 
     private SnowBiomeManager() {
-        LOGGER.warn("Nova Reimagined Snow manager init (DH mod present: {}, API ready: {})",
-                DhLevelResolver.isDhModPresent(), DhLevelResolver.isDhApiReady());
+        LOGGER.warn("Nova Reimagined Snow manager init (DH mod present: {}, API ready: {}, Season Cache bridge: {})",
+                DhLevelResolver.isDhModPresent(), DhLevelResolver.isDhApiReady(), SeasonCacheBridge.isAvailable());
     }
 
     public synchronized void initializeSnowVariantConfig() {
@@ -107,81 +140,118 @@ public class SnowBiomeManager {
     public void onWorldJoin(ClientWorld world, String worldKey) {
         int vanillaRenderDist = getVanillaRenderDistance();
         boolean dhPresent = DhLevelResolver.isDhModPresent();
-        int texSize = dhPresent
-                ? SnowBiomeTexture.MAX_SIZE
-                : computeTextureSize(vanillaRenderDist);
+        seasonCacheBridgeAvailable = SeasonCacheBridge.isAvailable();
+        runtimeMode = seasonCacheBridgeAvailable ? RuntimeMode.AUTHORITATIVE_PENDING : RuntimeMode.STANDALONE;
+        authoritativeProbeTicksRemaining = seasonCacheBridgeAvailable ? AUTHORITATIVE_PROBE_TICKS : 0;
+        lastSnapshotInProgress = null;
+        lastAuthoritativeEpoch = null;
+        authoritativeChunkEventsApplied = 0;
+        authoritativeResetsApplied = 0;
 
+        // Capture player chunk as the initial anchor so the texture is centered
+        // on the player from the very first allocation and meta upload.
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.player != null) {
+            anchorChunkX = (int) Math.floor(mc.player.getX()) >> 4;
+            anchorChunkZ = (int) Math.floor(mc.player.getZ()) >> 4;
+        } else {
+            anchorChunkX = 0;
+            anchorChunkZ = 0;
+        }
+        lastPlayerChunkX = anchorChunkX;
+        lastPlayerChunkZ = anchorChunkZ;
+        reAnchorTickCounter = RE_ANCHOR_INTERVAL_TICKS;
+
+        // Set anchor on the texture BEFORE allocate so the first meta upload
+        // carries the correct anchor chunk coordinates.
+        texture.setAnchor(anchorChunkX, anchorChunkZ);
+
+        int texSize = dhPresent ? SnowBiomeTexture.MAX_SIZE : computeTextureSize(vanillaRenderDist);
         lastRenderDistance = vanillaRenderDist;
 
         texture.allocate(texSize);
-
         cacheManager.onWorldJoin(worldKey);
-        restoreCachedTexture("world join");
         resetWeatherDebugState();
         refreshSnowVariantTextures("world join");
 
         queue.clear();
-        queue.enqueueAll(texture);
 
-        if (dhPresent) {
-            MinecraftClient mc = MinecraftClient.getInstance();
-            int playerChunkX = mc.player != null ? (int) mc.player.getX() >> 4 : 0;
-            int playerChunkZ = mc.player != null ? (int) mc.player.getZ() >> 4 : 0;
-            boolean singleplayer = DhLevelResolver.isSingleplayerSession();
-
-            dhScanner.start(playerChunkX, playerChunkZ, vanillaRenderDist, texSize, singleplayer);
-            // Queue a background re-verification of any previously cached DH chunks
-            // so state changes since the last session (e.g. seasonal transitions)
-            // are detected and corrected without requiring a cache wipe.
-            dhScanner.startVerificationSweep(cacheManager.getNonVanillaCachedChunks());
-            DhChunkListener.register();
+        if (runtimeMode == RuntimeMode.STANDALONE) {
+            restoreCachedTexture("world join");
+            queue.enqueueAll(texture);
+            startDhServicesIfNeeded();
+        } else {
+            texture.clear();
+            markTextureDirty("awaiting authoritative season cache snapshot");
+            LOGGER.warn("Season Cache bridge detected; delaying DH startup while awaiting authoritative session");
         }
 
-        LOGGER.warn("World joined — texture {}x{} chunks, {} in cache, DH mod present: {}, API ready: {}, scanner: {}, listener: {}",
-                texSize, texSize, cacheManager.cacheSize(), dhPresent, DhLevelResolver.isDhApiReady(),
-                dhPresent ? (dhScanner.isScanEnabled() ? "active(" + dhScanner.describeMode() + ")" : "inactive") : "inactive",
-                dhPresent ? "active" : "inactive");
+        LOGGER.warn("World joined — texture {}x{} chunks, {} in cache, runtimeMode={}, DH mod present: {}, API ready: {}, anchor=[{},{}]",
+                texSize, texSize, cacheManager.cacheSize(), runtimeMode, dhPresent, DhLevelResolver.isDhApiReady(),
+                anchorChunkX, anchorChunkZ);
     }
 
     public void onWorldLeave() {
-        if (DhLevelResolver.isDhModPresent()) {
-            DhChunkListener.unregister();
-            dhScanner.drainCompleted(cacheManager, texture);
-            dhScanner.stop();
-        }
+        stopDhServicesIfNeeded();
         queue.clear();
         texture.release();
         cacheManager.onWorldLeave();
         resetWeatherDebugState();
         lastRenderDistance = -1;
         needsUpload = false;
+        runtimeMode = RuntimeMode.STANDALONE;
+        seasonCacheBridgeAvailable = false;
+        authoritativeProbeTicksRemaining = 0;
+        lastSnapshotInProgress = null;
+        lastAuthoritativeEpoch = null;
+        authoritativeChunkEventsApplied = 0;
+        authoritativeResetsApplied = 0;
+        anchorChunkX = 0;
+        anchorChunkZ = 0;
+        lastPlayerChunkX = Integer.MIN_VALUE;
+        lastPlayerChunkZ = Integer.MIN_VALUE;
+        reAnchorTickCounter = RE_ANCHOR_INTERVAL_TICKS;
         LOGGER.warn("World left — biome textures released, cache flushed");
     }
 
     public void onDimensionChange(ClientWorld newWorld) {
-        if (DhLevelResolver.isDhModPresent()) {
-            DhChunkListener.unregister();
-            dhScanner.stop();
-
-            // Restart the scanner for the new dimension and immediately queue
-            // a verification sweep — returning to the overworld after time in
-            // another dimension is exactly when seasonal changes may have made
-            // previously cached DH snow states stale.
-            MinecraftClient mc = MinecraftClient.getInstance();
-            int playerChunkX = mc.player != null ? (int) mc.player.getX() >> 4 : 0;
-            int playerChunkZ = mc.player != null ? (int) mc.player.getZ() >> 4 : 0;
-            int vanillaRenderDist = mc.options.getViewDistance().getValue();
-            int texSize = texture.isAllocated() ? texture.getSize() : SnowBiomeTexture.MAX_SIZE;
-            boolean singleplayer = DhLevelResolver.isSingleplayerSession();
-
-            dhScanner.start(playerChunkX, playerChunkZ, vanillaRenderDist, texSize, singleplayer);
-            dhScanner.startVerificationSweep(cacheManager.getNonVanillaCachedChunks());
-            DhChunkListener.register();
-        }
+        stopDhServicesIfNeeded();
         queue.clear();
         resetWeatherDebugState();
-        if (texture.isAllocated()) {
+
+        if (!texture.isAllocated()) {
+            return;
+        }
+
+        seasonCacheBridgeAvailable = SeasonCacheBridge.isAvailable();
+        runtimeMode = seasonCacheBridgeAvailable ? RuntimeMode.AUTHORITATIVE_PENDING : RuntimeMode.STANDALONE;
+        authoritativeProbeTicksRemaining = seasonCacheBridgeAvailable ? AUTHORITATIVE_PROBE_TICKS : 0;
+        lastSnapshotInProgress = null;
+        lastAuthoritativeEpoch = null;
+        authoritativeChunkEventsApplied = 0;
+        authoritativeResetsApplied = 0;
+
+        // Re-anchor to the player's new position on dimension change.
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.player != null) {
+            anchorChunkX = (int) Math.floor(mc.player.getX()) >> 4;
+            anchorChunkZ = (int) Math.floor(mc.player.getZ()) >> 4;
+        }
+        lastPlayerChunkX = anchorChunkX;
+        lastPlayerChunkZ = anchorChunkZ;
+        reAnchorTickCounter = RE_ANCHOR_INTERVAL_TICKS;
+        texture.setAnchor(anchorChunkX, anchorChunkZ);
+
+        texture.clear();
+        markTextureDirty("dimension change clear");
+
+        if (runtimeMode == RuntimeMode.STANDALONE) {
             restoreCachedTexture("dimension change");
+            queue.enqueueAll(texture);
+            startDhServicesIfNeeded();
+        } else {
+            cacheManager.resetForAuthoritativeSession();
+            LOGGER.warn("Dimension change — awaiting authoritative Season Cache refresh");
         }
     }
 
@@ -189,7 +259,39 @@ public class SnowBiomeManager {
         if (!texture.isAllocated()) return;
         if (mc.world == null || mc.player == null) return;
 
-        if (!DhLevelResolver.isDhModPresent()) {
+        processAuthoritativeBridge(mc.world);
+
+        // Track player chunk position for teleport detection and periodic drift check.
+        int playerChunkX = (int) Math.floor(mc.player.getX()) >> 4;
+        int playerChunkZ = (int) Math.floor(mc.player.getZ()) >> 4;
+
+        if (lastPlayerChunkX != Integer.MIN_VALUE) {
+            int moveDx = Math.abs(playerChunkX - lastPlayerChunkX);
+            int moveDz = Math.abs(playerChunkZ - lastPlayerChunkZ);
+            if (moveDx > TELEPORT_THRESHOLD || moveDz > TELEPORT_THRESHOLD) {
+                // Sudden large position jump — re-anchor immediately.
+                reAnchor(playerChunkX, playerChunkZ, "teleport detected");
+            } else {
+                // Periodic drift check: re-anchor if player has moved far from anchor.
+                reAnchorTickCounter--;
+                if (reAnchorTickCounter <= 0) {
+                    reAnchorTickCounter = RE_ANCHOR_INTERVAL_TICKS;
+                    int driftX = Math.abs(playerChunkX - anchorChunkX);
+                    int driftZ = Math.abs(playerChunkZ - anchorChunkZ);
+                    if (driftX >= RE_ANCHOR_THRESHOLD || driftZ >= RE_ANCHOR_THRESHOLD) {
+                        reAnchor(playerChunkX, playerChunkZ, "periodic drift check");
+                    }
+                }
+            }
+        } else {
+            // First tick — initialise tracking counters.
+            reAnchorTickCounter = RE_ANCHOR_INTERVAL_TICKS;
+        }
+
+        lastPlayerChunkX = playerChunkX;
+        lastPlayerChunkZ = playerChunkZ;
+
+        if (runtimeMode == RuntimeMode.STANDALONE && !DhLevelResolver.isDhModPresent()) {
             int currentDist = getVanillaRenderDistance();
             if (currentDist != lastRenderDistance) {
                 LOGGER.warn("Render distance changed {} -> {} — reallocating",
@@ -202,11 +304,11 @@ public class SnowBiomeManager {
             }
         }
 
-        if (processVanillaQueue(mc.world)) {
+        if (runtimeMode == RuntimeMode.STANDALONE && processVanillaQueue(mc.world)) {
             markTextureDirty("vanilla queue");
         }
 
-        if (DhLevelResolver.isDhModPresent() && dhScanner.isActive()) {
+        if (runtimeMode == RuntimeMode.STANDALONE && DhLevelResolver.isDhModPresent() && dhScanner.isActive()) {
             if (dhScanner.tick(mc.world, texture, cacheManager, mc)) {
                 markTextureDirty("dh worker results");
             }
@@ -223,10 +325,16 @@ public class SnowBiomeManager {
     }
 
     public void onChunkLoad(int chunkX, int chunkZ) {
-        queue.enqueue(chunkX, chunkZ);
+        if (runtimeMode == RuntimeMode.STANDALONE) {
+            queue.enqueue(chunkX, chunkZ);
+        }
     }
 
     public void onDhChunkModified(IDhApiLevelWrapper levelWrapper, int chunkX, int chunkZ) {
+        if (runtimeMode != RuntimeMode.STANDALONE) {
+            return;
+        }
+
         MinecraftClient mc = MinecraftClient.getInstance();
         ClientWorld world = mc.world;
         if (world == null || !texture.isAllocated()) return;
@@ -263,6 +371,165 @@ public class SnowBiomeManager {
 
     public boolean isStormActive() {
         return currentThunderGradient > ACTIVE_THRESHOLD || currentIsThundering;
+    }
+
+    private void processAuthoritativeBridge(ClientWorld world) {
+        if (!seasonCacheBridgeAvailable) {
+            return;
+        }
+
+        if (SeasonCacheBridge.isAuthoritativeSessionActive() && runtimeMode != RuntimeMode.AUTHORITATIVE_ACTIVE) {
+            activateAuthoritativeMode("season cache session active");
+        }
+
+        List<SeasonCacheBridge.AuthoritativeEvent> events = SeasonCacheBridge.drainEvents();
+        if (!events.isEmpty() && runtimeMode != RuntimeMode.AUTHORITATIVE_ACTIVE) {
+            activateAuthoritativeMode("season cache events received");
+        }
+
+        RegistryKey<World> currentDimension = world.getRegistryKey();
+        boolean snapshotInProgress = SeasonCacheBridge.isSnapshotInProgress(currentDimension);
+        Integer authoritativeEpoch = SeasonCacheBridge.currentEpoch(currentDimension);
+        if (lastSnapshotInProgress == null || lastSnapshotInProgress != snapshotInProgress ||
+                (authoritativeEpoch != null && !authoritativeEpoch.equals(lastAuthoritativeEpoch))) {
+            LOGGER.warn("Season Cache authoritative status — dimension={}, snapshotInProgress={}, epoch={}, runtimeMode={}",
+                    currentDimension.getValue(), snapshotInProgress, authoritativeEpoch, runtimeMode);
+            lastSnapshotInProgress = snapshotInProgress;
+            lastAuthoritativeEpoch = authoritativeEpoch;
+        }
+
+        boolean anyTextureWrites = false;
+        int resetEventsAppliedThisTick = 0;
+        int chunkEventsAppliedThisTick = 0;
+        for (SeasonCacheBridge.AuthoritativeEvent event : events) {
+            if (event.dimension() == null || !event.dimension().equals(currentDimension)) {
+                continue;
+            }
+            switch (event.type()) {
+                case RESET -> {
+                    texture.clear();
+                    cacheManager.resetForAuthoritativeSession();
+                    anyTextureWrites = true;
+                    resetEventsAppliedThisTick++;
+                    authoritativeResetsApplied++;
+                    LOGGER.warn("Applied authoritative reset for {} epoch {}", event.dimension().getValue(), event.epoch());
+                }
+                case CHUNK_STATE -> {
+                    // Write guard: skip chunks outside the anchor window. Chunks beyond
+                    // ANCHOR_RADIUS in any direction alias into in-range texels, which
+                    // caused the "flush" where far non-snowy chunks overwrote nearby snowy
+                    // texels. Season Cache sends data for the whole world; Nova only applies
+                    // the window the player can actually see without aliasing.
+                    int dx = event.chunkX() - anchorChunkX;
+                    int dz = event.chunkZ() - anchorChunkZ;
+                    if (Math.abs(dx) >= ANCHOR_RADIUS || Math.abs(dz) >= ANCHOR_RADIUS) {
+                        break; // outside valid texel window — would alias, skip
+                    }
+                    cacheManager.writeAuthoritativeToTexture(event.chunkX(), event.chunkZ(), event.snowy(), texture);
+                    anyTextureWrites = true;
+                    chunkEventsAppliedThisTick++;
+                    authoritativeChunkEventsApplied++;
+                }
+                case UNKNOWN -> LOGGER.debug("Ignoring unknown Season Cache authoritative event type");
+            }
+        }
+
+        if (chunkEventsAppliedThisTick > 0 || resetEventsAppliedThisTick > 0) {
+            LOGGER.warn("Season Cache authoritative apply — dimension={}, resetEvents={}, chunkEvents={}, totalResets={}, totalChunkEvents={}",
+                    currentDimension.getValue(), resetEventsAppliedThisTick, chunkEventsAppliedThisTick,
+                    authoritativeResetsApplied, authoritativeChunkEventsApplied);
+        }
+
+        if (anyTextureWrites) {
+            markTextureDirty("authoritative season cache events");
+        }
+
+        if (runtimeMode == RuntimeMode.AUTHORITATIVE_PENDING && !SeasonCacheBridge.isAuthoritativeSessionActive() && !snapshotInProgress) {
+            authoritativeProbeTicksRemaining--;
+            if (authoritativeProbeTicksRemaining <= 0) {
+                activateStandaloneModeFromPending(world, "season cache probe timed out");
+            }
+        }
+    }
+
+    /**
+     * Re-centers the texture on a new player chunk position.
+     *
+     * Sequence:
+     *   1. Update anchor fields and push new anchor to the texture (updates meta).
+     *   2. Clear the texture (all previous texel positions are now stale).
+     *   3. Repaint from the in-memory cache, writing only chunks within the new
+     *      anchor window to avoid aliasing.
+     *   4. Mark dirty so the GPU sees the repainted texture on the next tick.
+     *
+     * In authoritative mode the cache contains all previously-received authoritative
+     * chunk states (writeAuthoritativeToTexture now persists them). The windowed
+     * repaint instantly restores the correct snow state for the new view area
+     * without requiring a new Season Cache snapshot.
+     */
+    private synchronized void reAnchor(int playerChunkX, int playerChunkZ, String reason) {
+        if (!texture.isAllocated()) return;
+        anchorChunkX = playerChunkX;
+        anchorChunkZ = playerChunkZ;
+        reAnchorTickCounter = RE_ANCHOR_INTERVAL_TICKS;
+
+        texture.setAnchor(playerChunkX, playerChunkZ);
+        texture.clear();
+        restoreCachedTexture("re-anchor: " + reason);
+        markTextureDirty("re-anchor: " + reason);
+
+        LOGGER.warn("Re-anchored texture to chunk [{},{}] — {}", playerChunkX, playerChunkZ, reason);
+    }
+
+    private void activateAuthoritativeMode(String reason) {
+        if (runtimeMode == RuntimeMode.AUTHORITATIVE_ACTIVE) {
+            return;
+        }
+        stopDhServicesIfNeeded();
+        queue.clear();
+        cacheManager.resetForAuthoritativeSession();
+        texture.clear();
+        markTextureDirty("authoritative mode activation");
+        runtimeMode = RuntimeMode.AUTHORITATIVE_ACTIVE;
+        authoritativeProbeTicksRemaining = 0;
+        LOGGER.warn("Authoritative Season Cache mode active ({})", reason);
+    }
+
+    private void activateStandaloneModeFromPending(ClientWorld world, String reason) {
+        if (runtimeMode == RuntimeMode.STANDALONE) {
+            return;
+        }
+        runtimeMode = RuntimeMode.STANDALONE;
+        authoritativeProbeTicksRemaining = 0;
+        LOGGER.warn("Falling back to standalone Nova mode ({})", reason);
+        restoreCachedTexture("authoritative fallback");
+        queue.enqueueAll(texture);
+        startDhServicesIfNeeded();
+    }
+
+    private void startDhServicesIfNeeded() {
+        if (!DhLevelResolver.isDhModPresent()) {
+            return;
+        }
+        MinecraftClient mc = MinecraftClient.getInstance();
+        int vanillaRenderDist = getVanillaRenderDistance();
+        int texSize = texture.isAllocated() ? texture.getSize() : SnowBiomeTexture.MAX_SIZE;
+        int playerChunkX = mc.player != null ? (int) mc.player.getX() >> 4 : 0;
+        int playerChunkZ = mc.player != null ? (int) mc.player.getZ() >> 4 : 0;
+        boolean singleplayer = DhLevelResolver.isSingleplayerSession();
+
+        dhScanner.start(playerChunkX, playerChunkZ, vanillaRenderDist, texSize, singleplayer);
+        dhScanner.startVerificationSweep(cacheManager.getNonVanillaCachedChunks());
+        DhChunkListener.register();
+    }
+
+    private void stopDhServicesIfNeeded() {
+        if (!DhLevelResolver.isDhModPresent()) {
+            return;
+        }
+        DhChunkListener.unregister();
+        dhScanner.drainCompleted(cacheManager, texture);
+        dhScanner.stop();
     }
 
     private void resetWeatherDebugState() {
@@ -386,7 +653,8 @@ public class SnowBiomeManager {
     }
 
     private void restoreCachedTexture(String source) {
-        int restored = cacheManager.writeAllCachedToTexture(texture);
+        int restored = cacheManager.writeWindowedCacheToTexture(
+                texture, anchorChunkX, anchorChunkZ, ANCHOR_RADIUS);
         if (restored > 0) {
             LOGGER.warn("Cache restore for {} wrote {} chunk texels and queued an upload", source, restored);
             markTextureDirty("cache restore: " + source);
