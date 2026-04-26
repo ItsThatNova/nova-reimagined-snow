@@ -9,7 +9,8 @@
   ],
   "contact": {
     "homepage": "https://github.com/ItsThatNova/complementary-snow",
-    "sources": "https://github.com/ItsThatNova/complementary-snow"
+    "sources": "https://github.com/ItsThatNova/complementary-snow",
+    "issues": "https://github.com/ItsThatNova/complementary-snow/issues"
   },
   "license": "MIT",
   "icon": "assets/compsnow/icon.png",
@@ -20,7 +21,7 @@
     ]
   },
   "depends": {
-    "fabricloader": ">=0.15.0",
+    "fabricloader": ">=0.16.5",
     "fabric-api": "*",
     "minecraft": "~1.21"
   },

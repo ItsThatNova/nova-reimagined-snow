@@ -41,7 +41,7 @@ public class SnowBiomeTexture {
     // Texture size in chunks. 256 gives a 128-chunk radius around the player anchor,
     // covering any practical DH render distance (192 chunks) with margin to spare.
     // At 256x256 the upload cost is ~256KB -- effectively free even when dirty every tick.
-    public static final int MAX_SIZE = 256;
+    public static final int MAX_SIZE = 2048;
 
     // Half the texture size. The player anchor always sits at texel (HALF_SIZE, HALF_SIZE).
     public static final int HALF_SIZE = MAX_SIZE / 2;
@@ -183,24 +183,32 @@ public class SnowBiomeTexture {
      * Encodes texture size and player anchor into the 1x1 meta texture.
      *
      * Channel layout (ABGR in NativeImage int, RGBA in shader):
-     *   R = (log2(size) - 5) / 5.0   size encoding, 32-256 -> 0.0-0.8
-     *   G = floorMod(anchorChunkX, 256) / 255.0   anchor X mod 256
-     *   B = floorMod(anchorChunkZ, 256) / 255.0   anchor Z mod 256
-     *   A = 255 (mod active flag)
+     *   R = (log2(size) - 5) / 6.0   size encoding, 32-2048 -> 0.0-1.0
+     *   G = (floorMod(anchorChunkX, 2048) & 0xFF) / 255.0   anchor X low 8 bits
+     *   B = (floorMod(anchorChunkZ, 2048) & 0xFF) / 255.0   anchor Z low 8 bits
+     *   A = 0x80 | (anchorX_high3 << 4) | (anchorZ_high3 << 1)
+     *       bit7 = active flag (always 1 when active)
+     *       bits4-6 = high 3 bits of anchorX mod 2048
+     *       bits1-3 = high 3 bits of anchorZ mod 2048
      *
-     * The shader decodes anchor as int(round(meta.g * 255)) and uses it in
-     * the same modular formula as texXForChunk to arrive at the correct texel.
-     * Passing only mod-256 is sufficient because modular arithmetic is periodic
-     * with the same 256-chunk period as the texture.
+     * Together G + A[4-6] give 11 bits of anchor X precision (mod 2048).
+     * Together B + A[1-3] give 11 bits of anchor Z precision (mod 2048).
+     * This is required for textures larger than 256 chunks — the old mod-256
+     * encoding caused incorrect texel lookups at texture sizes >= 512.
      */
     private void updateMeta() {
         if (metaTexture == null) return;
-        float sizeEncoded = (log2(size) - 5.0f) / 5.0f;
+        float sizeEncoded = (log2(size) - 5.0f) / 6.0f;
         int r = clamp255(Math.round(sizeEncoded * 255));
-        int g = Math.floorMod(anchorChunkX, 256);   // 0-255, anchor X mod 256
-        int b = Math.floorMod(anchorChunkZ, 256);   // 0-255, anchor Z mod 256
-        // NativeImage ABGR: A=255, B=b, G=g, R=r
-        int packed = (255 << 24) | (b << 16) | (g << 8) | r;
+        int anchorXMod = Math.floorMod(anchorChunkX, 2048); // 0-2047, 11 bits
+        int anchorZMod = Math.floorMod(anchorChunkZ, 2048);
+        int g = anchorXMod & 0xFF;                          // low 8 bits of X
+        int b = anchorZMod & 0xFF;                          // low 8 bits of Z
+        int aHighBits = (((anchorXMod >> 8) & 0x7) << 4)   // bits 4-6 = X high 3
+                      | (((anchorZMod >> 8) & 0x7) << 1);  // bits 1-3 = Z high 3
+        int a = 0x80 | aHighBits;                          // bit 7 = active flag
+        // NativeImage ABGR: A=a, B=b, G=g, R=r
+        int packed = (a << 24) | (b << 16) | (g << 8) | r;
         metaTexture.getImage().setColor(0, 0, packed);
     }
 

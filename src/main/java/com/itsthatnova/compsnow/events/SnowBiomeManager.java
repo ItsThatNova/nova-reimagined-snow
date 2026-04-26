@@ -2,6 +2,9 @@ package com.itsthatnova.compsnow.events;
 
 import com.itsthatnova.compsnow.config.SnowVariantConfig;
 import com.itsthatnova.compsnow.integration.SeasonCacheBridge;
+import com.itsthatnova.compsnow.texture.DhLodTextureResolver;
+import com.itsthatnova.compsnow.texture.DhLodTextureSet;
+import com.itsthatnova.compsnow.texture.ResolvedDhLodTextureSet;
 import com.itsthatnova.compsnow.texture.ResolvedSnowVariantSet;
 import com.itsthatnova.compsnow.texture.SnowBiomeTexture;
 import com.itsthatnova.compsnow.texture.SnowVariantResolver;
@@ -38,8 +41,8 @@ public class SnowBiomeManager {
     // Teleports (sudden movement > TELEPORT_THRESHOLD chunks in one tick) trigger
     // an immediate re-anchor without waiting for the periodic interval.
     private static final int ANCHOR_RADIUS           = SnowBiomeTexture.HALF_SIZE; // 128
-    private static final int RE_ANCHOR_INTERVAL_TICKS = 1200; // 60 seconds at 20 TPS
-    private static final int RE_ANCHOR_THRESHOLD      = 128;  // chunks from anchor
+    private static final int RE_ANCHOR_INTERVAL_TICKS = 20;  // check every second
+    private static final int RE_ANCHOR_THRESHOLD      = SnowBiomeTexture.HALF_SIZE / 2; // re-anchor at halfway point
     private static final int TELEPORT_THRESHOLD       = 8;    // chunks/tick sudden jump
 
     private enum RuntimeMode {
@@ -55,6 +58,8 @@ public class SnowBiomeManager {
 
     private final SnowVariantResolver snowVariantResolver = new SnowVariantResolver();
     private final SnowVariantTextureSet snowVariantTextures = new SnowVariantTextureSet();
+    private final DhLodTextureResolver dhLodTextureResolver = new DhLodTextureResolver();
+    private final DhLodTextureSet dhLodTextures = new DhLodTextureSet();
     private SnowVariantConfig snowVariantConfig = SnowVariantConfig.defaults();
 
     private int lastRenderDistance = -1;
@@ -129,10 +134,13 @@ public class SnowBiomeManager {
     private synchronized void refreshSnowVariantTexturesNow(String reason, ResourceManager resourceManager) {
         try {
             snowVariantConfig = SnowVariantConfig.loadOrCreate();
-            ResolvedSnowVariantSet resolved = snowVariantResolver.resolve(resourceManager, snowVariantConfig);
-            snowVariantTextures.replace(resolved, reason);
+            ResolvedSnowVariantSet resolvedSnow = snowVariantResolver.resolve(resourceManager, snowVariantConfig);
+            snowVariantTextures.replace(resolvedSnow, reason);
+
+            ResolvedDhLodTextureSet resolvedDh = dhLodTextureResolver.resolve(resourceManager, snowVariantConfig);
+            dhLodTextures.replace(resolvedDh, reason);
         } catch (Exception e) {
-            LOGGER.warn("Failed to rebuild resolved snow variants [{}]; keeping previous textures. {}",
+            LOGGER.warn("Failed to rebuild resolved snow variants / DH LOD textures [{}]; keeping previous textures. {}",
                     reason, e.getMessage());
         }
     }
@@ -308,6 +316,7 @@ public class SnowBiomeManager {
             markTextureDirty("vanilla queue");
         }
 
+        // DH scanner only runs in STANDALONE — authoritative mode handles DH via onDhChunkModified
         if (runtimeMode == RuntimeMode.STANDALONE && DhLevelResolver.isDhModPresent() && dhScanner.isActive()) {
             if (dhScanner.tick(mc.world, texture, cacheManager, mc)) {
                 markTextureDirty("dh worker results");
@@ -331,21 +340,38 @@ public class SnowBiomeManager {
     }
 
     public void onDhChunkModified(IDhApiLevelWrapper levelWrapper, int chunkX, int chunkZ) {
-        if (runtimeMode != RuntimeMode.STANDALONE) {
-            return;
-        }
-
         MinecraftClient mc = MinecraftClient.getInstance();
         ClientWorld world = mc.world;
         if (world == null || !texture.isAllocated()) return;
         if (!World.OVERWORLD.equals(world.getRegistryKey())) return;
 
-        IDhApiLevelWrapper resolvedWrapper = levelWrapper != null ? levelWrapper : DhLevelResolver.resolveActiveLevelWrapper(world);
+        if (runtimeMode == RuntimeMode.AUTHORITATIVE_ACTIVE) {
+            // In authoritative mode, apply SC's known state for this chunk directly
+            // when DH regenerates its LOD data (e.g. after SC removes snow blocks).
+            // This gives instant DH LOD snow updates without waiting for the coverage
+            // builder event stream. If SC hasn't sent this chunk's state yet, we skip
+            // and wait for the event stream to fill it in.
+            Boolean snowy = SeasonCacheBridge.getChunkSnowState(world.getRegistryKey(), chunkX, chunkZ);
+            if (snowy != null) {
+                int dx = chunkX - anchorChunkX;
+                int dz = chunkZ - anchorChunkZ;
+                if (Math.abs(dx) < ANCHOR_RADIUS && Math.abs(dz) < ANCHOR_RADIUS) {
+                    if (cacheManager.writeAuthoritativeToTexture(chunkX, chunkZ, snowy, texture)) {
+                        markTextureDirty("dh-listener-authoritative");
+                    }
+                } else {
+                    cacheManager.cacheAuthoritativeOnly(chunkX, chunkZ, snowy);
+                }
+            }
+            return;
+        }
+
+        IDhApiLevelWrapper resolvedWrapper = levelWrapper != null ? levelWrapper
+                : DhLevelResolver.resolveActiveLevelWrapper(world);
         if (resolvedWrapper == null) {
             LOGGER.debug("Ignoring DH chunk ({}, {}) because no active level wrapper was available", chunkX, chunkZ);
             return;
         }
-
         dhScanner.enqueueDhChunk(resolvedWrapper, chunkX, chunkZ, "dh-listener");
     }
 
@@ -415,20 +441,24 @@ public class SnowBiomeManager {
                     LOGGER.warn("Applied authoritative reset for {} epoch {}", event.dimension().getValue(), event.epoch());
                 }
                 case CHUNK_STATE -> {
-                    // Write guard: skip chunks outside the anchor window. Chunks beyond
-                    // ANCHOR_RADIUS in any direction alias into in-range texels, which
-                    // caused the "flush" where far non-snowy chunks overwrote nearby snowy
-                    // texels. Season Cache sends data for the whole world; Nova only applies
-                    // the window the player can actually see without aliasing.
+                    // Always cache authoritative state regardless of anchor window position.
+                    // This ensures re-anchor repaints have complete data for any area the
+                    // player flies to, without needing a new Season Cache snapshot.
                     int dx = event.chunkX() - anchorChunkX;
                     int dz = event.chunkZ() - anchorChunkZ;
-                    if (Math.abs(dx) >= ANCHOR_RADIUS || Math.abs(dz) >= ANCHOR_RADIUS) {
-                        break; // outside valid texel window — would alias, skip
+                    boolean inWindow = Math.abs(dx) < ANCHOR_RADIUS && Math.abs(dz) < ANCHOR_RADIUS;
+
+                    if (inWindow) {
+                        // In-window: write to both cache and texture.
+                        cacheManager.writeAuthoritativeToTexture(event.chunkX(), event.chunkZ(), event.snowy(), texture);
+                        anyTextureWrites = true;
+                        chunkEventsAppliedThisTick++;
+                        authoritativeChunkEventsApplied++;
+                    } else {
+                        // Out-of-window: cache only — writing to the texture would alias
+                        // distant chunks into texels used by nearby chunks.
+                        cacheManager.cacheAuthoritativeOnly(event.chunkX(), event.chunkZ(), event.snowy());
                     }
-                    cacheManager.writeAuthoritativeToTexture(event.chunkX(), event.chunkZ(), event.snowy(), texture);
-                    anyTextureWrites = true;
-                    chunkEventsAppliedThisTick++;
-                    authoritativeChunkEventsApplied++;
                 }
                 case UNKNOWN -> LOGGER.debug("Ignoring unknown Season Cache authoritative event type");
             }

@@ -69,6 +69,21 @@ public final class SeasonCacheBridge {
         }
     }
 
+    /**
+     * Returns the authoritative snow state for a specific chunk, or null if
+     * Season Cache has not yet sent data for this chunk this session.
+     * Used by onDhChunkModified to apply the correct state when DH regenerates LODs.
+     */
+    public static Boolean getChunkSnowState(RegistryKey<World> dimension, int chunkX, int chunkZ) {
+        if (!AVAILABLE || HANDLE.getChunkSnowState == null || dimension == null) return null;
+        try {
+            return (Boolean) HANDLE.getChunkSnowState.invoke(null, dimension, chunkX, chunkZ);
+        } catch (IllegalAccessException | InvocationTargetException e) {
+            LOGGER.warn("Season Cache bridge chunk state query failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
     public static List<AuthoritativeEvent> drainEvents() {
         if (!AVAILABLE) return Collections.emptyList();
         try {
@@ -116,6 +131,14 @@ public final class SeasonCacheBridge {
             Method eventChunkX = eventClass.getMethod("chunkX");
             Method eventChunkZ = eventClass.getMethod("chunkZ");
             Method eventSnowy = eventClass.getMethod("snowy");
+            // getChunkSnowState is optional — older SC versions may not have it
+            Method getChunkSnowState = null;
+            try {
+                getChunkSnowState = apiClass.getMethod("getChunkSnowState",
+                        RegistryKey.class, int.class, int.class);
+            } catch (NoSuchMethodException ignored) {
+                LOGGER.warn("Season Cache bridge: getChunkSnowState not available (older SC version)");
+            }
             LOGGER.warn("Season Cache bridge active via reflection");
             return new BridgeHandle(
                     isAuthoritativeSessionActive,
@@ -127,7 +150,8 @@ public final class SeasonCacheBridge {
                     eventEpoch,
                     eventChunkX,
                     eventChunkZ,
-                    eventSnowy
+                    eventSnowy,
+                    getChunkSnowState
             );
         } catch (ReflectiveOperationException e) {
             LOGGER.warn("Season Cache mod is present but Nova could not resolve its client API: {}", e.getMessage());
@@ -161,7 +185,8 @@ public final class SeasonCacheBridge {
             Method eventEpoch,
             Method eventChunkX,
             Method eventChunkZ,
-            Method eventSnowy
+            Method eventSnowy,
+            Method getChunkSnowState
     ) {
     }
 }

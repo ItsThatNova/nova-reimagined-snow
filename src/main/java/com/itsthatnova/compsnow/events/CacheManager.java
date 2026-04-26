@@ -178,6 +178,24 @@ public class CacheManager {
     }
 
     /**
+     * Persists an authoritative chunk state to the cache without writing to the texture.
+     * Used for chunks outside the current anchor window — they must not be written to
+     * the texture (aliasing risk) but must be cached so re-anchor repaints can restore
+     * them once they fall within the new window.
+     */
+    public void cacheAuthoritativeOnly(int chunkX, int chunkZ, boolean snowy) {
+        float intensity = snowy ? 1.0f : 0.0f;
+        long key = packKey(chunkX, chunkZ);
+        Float previous = cache.get(key);
+        boolean changed = previous == null || Math.abs(previous - intensity) >= 0.004f;
+        if (changed) {
+            cache.put(key, intensity);
+            dirty.add(key);
+        }
+        sourceMap.put(key, Source.AUTHORITATIVE);
+    }
+
+    /**
      * Canonical cached-write path for any source that already has a cache entry.
      */
     public boolean writeCachedToTexture(int chunkX, int chunkZ, SnowBiomeTexture tex, String source) {
